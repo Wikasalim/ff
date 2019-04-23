@@ -10,6 +10,10 @@ const config = require('../config/settings.json');
 const queueFilename = './data/queue.txt';
 
 let owner = undefined;
+let channel = undefined;
+let listeners = 0;
+let dispatcher = undefined;
+
 const queue = fs.readFileSync(queueFilename).toString().split('\n');
 const queueLength = queue.length;
 
@@ -26,21 +30,33 @@ function updatePresence(songTitle) {
 
 async function playMusic(conn, entry = 0) {
   const song = queue[entry];
-  const stream = ytdl(song, { filter: 'audioonly' });
 
-  stream.on('info', info => {
-    logger.info(`Playing: ${info.title}`);
-    updatePresence(info.title);
-  });
+  try {
+    const stream = ytdl(song, { filter: 'audioonly' });
 
-  const dispatcher = await conn.play(stream);
+    stream.on('info', info => {
+      logger.info(`Playing: ${info.title}`);
+      updatePresence(info.title);
 
-  dispatcher.on('end', () => {
+      if (listeners <= 1) {
+        dispatcher.pause();
+        logger.info(`Nobody is listening in ${channel.name}, music has been paused.`);
+      }
+    });
+  
+    dispatcher = await conn.play(stream);
+  
+    dispatcher.on('end', () => {
+      if (entry == queueLength - 1) playMusic(conn);
+      else playMusic(conn, entry + 1);
+    });
+  
+    dispatcher.on('error', err => logger.error(err));
+  } catch (err) {
+    logger.error(err);
     if (entry == queueLength - 1) playMusic(conn);
     else playMusic(conn, entry + 1);
-  });
-
-  dispatcher.on('error', err => logger.error(err));
+  }
 }
 
 client.on('ready', () => {
@@ -56,6 +72,8 @@ client.on('ready', () => {
         voiceChannel.join()
           .then( connection => {
             logger.info(`Joined ${voiceChannel.name}.`);
+            channel = voiceChannel;
+            listeners = connection.channel.members.reduce((total) => total + 1, 0);
             playMusic(connection);
           }).catch( err => {
             owner.send('Something went wrong when trying to connect to the voice channel!');
@@ -69,6 +87,40 @@ client.on('ready', () => {
       else owner.send('Something went wrong when trying to look for the channel I was supposed to join!');
       logger.error(err);
     });
+});
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  if (!oldState || !newState) return;
+
+  const oldChannel = oldState.channel ? oldState.channel.id : null;
+  const newChannel = newState.channel ? newState.channel.id : null;
+
+  if (oldChannel != newChannel) {
+    const bot = newChannel ? newState.channel.members.find( member => member.id == client.user.id) : null;
+    if (bot) channel = bot.voice.channel;
+
+    function playPauseDispatcher() {
+      if (dispatcher) {
+        if (listeners > 1) {
+          dispatcher.resume();
+          logger.info(`Music has resumed, ${listeners - 1} member(s) are currently listening.`);
+        } else {
+          dispatcher.pause();
+          logger.info(`Nobody is listening in ${channel.name}, music has paused.`);
+        }
+      }
+    }
+
+    if (newChannel == channel.id) {
+      listeners = channel.members.reduce((total) => total + 1, 0);
+      logger.info(`${newState.member.displayName} has joined ${channel.name}.`);
+      playPauseDispatcher();
+    } else if (oldChannel == channel.id) {
+      listeners = channel.members.reduce((total) => total + 1, 0);
+      logger.info(`${oldState.member.displayName} has left ${channel.name}.`);
+      playPauseDispatcher();
+    }
+  }
 });
 
 client.on('guildUnavailable', guild => {
